@@ -1607,6 +1607,185 @@ static void batch_camera_path_free(ListBase *camera_paths)
 	}
 }
 
+static bool camera_is_stereo3d(Scene *scene, View3D *v3d, Object *ob)
+{
+	return (ob == v3d->camera) &&
+	       (scene->r.scemode & R_MULTIVIEW) != 0 &&
+	       (v3d->stereo3d_flag);
+}
+
+static void camera_stereo3d(
+        OBJECT_ShadingGroupList *sgl,
+        Scene *scene, ViewLayer *view_layer, View3D *v3d, RegionView3D *rv3d,
+        Object *ob, const Camera *cam,
+        float vec[4][3], float drawsize, const float scale[3])
+{
+#if 1
+	UNUSED_VARS(scene, v3d, rv3d, ob, cam, vec, drawsize, scale);
+#else
+	float obmat[4][4];
+	float vec_lr[2][4][3];
+	const float fac = (cam->stereo.pivot == CAM_S3D_PIVOT_CENTER) ? 2.0f : 1.0f;
+	float origin[2][3] = { {0} };
+	float tvec[3];
+	const Camera *cam_lr[2];
+	const char *names[2] = { STEREO_LEFT_NAME, STEREO_RIGHT_NAME };
+
+	const bool is_stereo3d_cameras = (v3d->stereo3d_flag & V3D_S3D_DISPCAMERAS) && (scene->r.views_format == SCE_VIEWS_FORMAT_STEREO_3D);
+	const bool is_stereo3d_plane = (v3d->stereo3d_flag & V3D_S3D_DISPPLANE) && (scene->r.views_format == SCE_VIEWS_FORMAT_STEREO_3D);
+	const bool is_stereo3d_volume = (v3d->stereo3d_flag & V3D_S3D_DISPVOLUME);
+
+	zero_v3(tvec);
+
+	glPushMatrix();
+
+	for (int i = 0; i < 2; i++) {
+		ob = BKE_camera_multiview_render(scene, ob, names[i]);
+		cam_lr[i] = ob->data;
+
+		glLoadMatrixf(rv3d->viewmat);
+		BKE_camera_multiview_model_matrix(&scene->r, ob, names[i], obmat);
+		glMultMatrixf(obmat);
+
+		copy_m3_m3(vec_lr[i], vec);
+		copy_v3_v3(vec_lr[i][3], vec[3]);
+
+		if (cam->stereo.convergence_mode == CAM_S3D_OFFAXIS) {
+			const float shift_x =
+				((BKE_camera_multiview_shift_x(&scene->r, ob, names[i]) - cam->shiftx) *
+				(drawsize * scale[0] * fac));
+
+			for (int j = 0; j < 4; j++) {
+				vec_lr[i][j][0] += shift_x;
+			}
+		}
+
+		if (is_stereo3d_cameras) {
+			/* camera frame */
+			drawcamera_frame(vec_lr[i], GL_LINE_LOOP);
+
+			/* center point to camera frame */
+			drawcamera_framelines(vec_lr[i], tvec);
+		}
+
+		/* connecting line */
+		mul_m4_v3(obmat, origin[i]);
+
+		/* convergence plane */
+		if (is_stereo3d_plane || is_stereo3d_volume) {
+			for (int j = 0; j < 4; j++) {
+				mul_m4_v3(obmat, vec_lr[i][j]);
+			}
+		}
+	}
+
+
+	/* the remaining drawing takes place in the view space */
+	glLoadMatrixf(rv3d->viewmat);
+
+	if (is_stereo3d_cameras) {
+		/* draw connecting lines */
+		GPU_basic_shader_bind_enable(GPU_SHADER_LINE | GPU_SHADER_STIPPLE);
+		GPU_basic_shader_line_stipple(2, 0xAAAA);
+
+		glBegin(GL_LINES);
+		glVertex3fv(origin[0]);
+		glVertex3fv(origin[1]);
+		glEnd();
+
+		GPU_basic_shader_bind_disable(GPU_SHADER_LINE | GPU_SHADER_STIPPLE);
+	}
+
+	/* draw convergence plane */
+	if (is_stereo3d_plane) {
+		float axis_center[3], screen_center[3];
+		float world_plane[4][3];
+		float local_plane[4][3];
+		float offset;
+
+		mid_v3_v3v3(axis_center, origin[0], origin[1]);
+
+		for (int i = 0; i < 4; i++) {
+			mid_v3_v3v3(world_plane[i], vec_lr[0][i], vec_lr[1][i]);
+			sub_v3_v3v3(local_plane[i], world_plane[i], axis_center);
+		}
+
+		mid_v3_v3v3(screen_center, world_plane[0], world_plane[2]);
+		offset = cam->stereo.convergence_distance / len_v3v3(screen_center, axis_center);
+
+		for (int i = 0; i < 4; i++) {
+			mul_v3_fl(local_plane[i], offset);
+			add_v3_v3(local_plane[i], axis_center);
+		}
+
+		glColor3f(0.0f, 0.0f, 0.0f);
+
+		/* camera frame */
+		drawcamera_frame(local_plane, GL_LINE_LOOP);
+
+		if (v3d->stereo3d_convergence_alpha > 0.0f) {
+			glEnable(GL_BLEND);
+			glDepthMask(0);  /* disable write in zbuffer, needed for nice transp */
+
+			glColor4f(0.0f, 0.0f, 0.0f, v3d->stereo3d_convergence_alpha);
+
+			drawcamera_frame(local_plane, GL_QUADS);
+
+			glDisable(GL_BLEND);
+			glDepthMask(1);  /* restore write in zbuffer */
+		}
+	}
+
+	/* draw convergence plane */
+	if (is_stereo3d_volume) {
+		float screen_center[3];
+		float near_plane[4][3], far_plane[4][3];
+
+		for (int i = 0; i < 2; i++) {
+			mid_v3_v3v3(screen_center, vec_lr[i][0], vec_lr[i][2]);
+
+			float offset = len_v3v3(screen_center, origin[i]);
+
+			for (int j = 0; j < 4; j++) {
+				sub_v3_v3v3(near_plane[j], vec_lr[i][j], origin[i]);
+				mul_v3_fl(near_plane[j], cam_lr[i]->clipsta / offset);
+				add_v3_v3(near_plane[j], origin[i]);
+
+				sub_v3_v3v3(far_plane[j], vec_lr[i][j], origin[i]);
+				mul_v3_fl(far_plane[j], cam_lr[i]->clipend / offset);
+				add_v3_v3(far_plane[j], origin[i]);
+			}
+
+			/* camera frame */
+			glColor3f(0.0f, 0.0f, 0.0f);
+
+			drawcamera_frame(near_plane, GL_LINE_LOOP);
+			drawcamera_frame(far_plane, GL_LINE_LOOP);
+			drawcamera_volume(near_plane, far_plane, GL_LINE_LOOP);
+
+			if (v3d->stereo3d_volume_alpha > 0.0f) {
+				glEnable(GL_BLEND);
+				glDepthMask(0);  /* disable write in zbuffer, needed for nice transp */
+
+				if (i == 0)
+					glColor4f(0.0f, 1.0f, 1.0f, v3d->stereo3d_volume_alpha);
+				else
+					glColor4f(1.0f, 0.0f, 0.0f, v3d->stereo3d_volume_alpha);
+
+				drawcamera_frame(near_plane, GL_QUADS);
+				drawcamera_frame(far_plane, GL_QUADS);
+				drawcamera_volume(near_plane, far_plane, GL_QUADS);
+
+				glDisable(GL_BLEND);
+				glDepthMask(1);  /* restore write in zbuffer */
+			}
+		}
+	}
+
+	glPopMatrix();
+#endif
+}
+
 static void DRW_shgroup_camera(OBJECT_ShadingGroupList *sgl, Object *ob, ViewLayer *view_layer)
 {
 	const DRWContextState *draw_ctx = DRW_context_state_get();
@@ -1616,16 +1795,36 @@ static void DRW_shgroup_camera(OBJECT_ShadingGroupList *sgl, Object *ob, ViewLay
 
 	Camera *cam = ob->data;
 	const  Object *camera_object = DEG_get_evaluated_object(draw_ctx->depsgraph, v3d->camera);
+	const bool is_select = DRW_state_is_select();
 	const bool is_active = (ob == camera_object);
 	const bool look_through = (is_active && (rv3d->persp == RV3D_CAMOB));
+	const bool is_multiview = (scene->r.scemode & R_MULTIVIEW) != 0;
+	const bool is_stereo3d = camera_is_stereo3d(scene, v3d, ob);
+	const bool is_stereo3d_view = (scene->r.views_format == SCE_VIEWS_FORMAT_STEREO_3D);
+	const bool is_stereo3d_cameras = (ob == scene->camera) &&
+	                                 is_multiview &&
+	                                 is_stereo3d_view &&
+	                                 (v3d->stereo3d_flag & V3D_S3D_DISPCAMERAS);
+	const bool is_selection_camera_stereo = is_select &&
+		                                    look_through && is_multiview &&
+	                                        is_stereo3d_view;
+
 	float *color;
 	DRW_object_wire_theme_get(ob, view_layer, &color);
 
 	float vec[4][3], asp[2], shift[2], scale[3], drawsize;
 
-	scale[0] = 1.0f / len_v3(ob->obmat[0]);
-	scale[1] = 1.0f / len_v3(ob->obmat[1]);
-	scale[2] = 1.0f / len_v3(ob->obmat[2]);
+	/* BKE_camera_multiview_model_matrix already accounts for scale, don't do it here */
+	if (is_selection_camera_stereo) {
+		scale[0] = 1.0f;
+		scale[1] = 1.0f;
+		scale[2] = 1.0f;
+	}
+	else {
+		scale[0] = 1.0f / len_v3(ob->obmat[0]);
+		scale[1] = 1.0f / len_v3(ob->obmat[1]);
+		scale[2] = 1.0f / len_v3(ob->obmat[2]);
+	}
 
 	BKE_camera_view_frame_ex(scene, cam, cam->drawsize, false, scale,
 	                         asp, shift, &drawsize, vec);
@@ -1645,16 +1844,26 @@ static void DRW_shgroup_camera(OBJECT_ShadingGroupList *sgl, Object *ob, ViewLay
 	cam->drwtria[1][0] = shift[0];
 	cam->drwtria[1][1] = shift[1] + ((1.1f * drawsize * (asp[1] + 0.7f)) * scale[1]);
 
-	if (look_through) {
-		/* Only draw the frame. */
+	if (look_through && !is_stereo3d_cameras) {
+		float mat[4][4];
+		if (is_selection_camera_stereo) {
+			/* Make sure selection uses the same matrix for camera as the one used while viewing. */
+			const bool is_left = v3d->multiview_eye == STEREO_LEFT_ID;
+			BKE_camera_multiview_model_matrix(&scene->r, ob, is_left ? STEREO_LEFT_NAME : STEREO_RIGHT_NAME, mat);
+		}
+		else {
+			copy_m4_m4(mat, ob->obmat);
+		}
 		DRW_shgroup_call_dynamic_add(
-		        sgl->camera_frame, color, cam->drwcorners,
-		        &cam->drwdepth, cam->drwtria, ob->obmat);
+		    sgl->camera_frame, color, cam->drwcorners,
+		    &cam->drwdepth, cam->drwtria, mat);
 	}
-	else {
-		DRW_shgroup_call_dynamic_add(
-		        sgl->camera, color, cam->drwcorners,
-		        &cam->drwdepth, cam->drwtria, ob->obmat);
+	else if (!look_through) {
+		if (!is_stereo3d_cameras) {
+			DRW_shgroup_call_dynamic_add(
+			        sgl->camera, color, cam->drwcorners,
+			        &cam->drwdepth, cam->drwtria, ob->obmat);
+		}
 
 		/* Active cam */
 		if (is_active) {
@@ -1704,11 +1913,15 @@ static void DRW_shgroup_camera(OBJECT_ShadingGroupList *sgl, Object *ob, ViewLay
 		}
 	}
 
+	/* Stereo cameras drawing. */
+	if (is_stereo3d) {
+		camera_stereo3d(sgl, scene, view_layer, v3d, rv3d, ob, cam, vec, drawsize, scale);
+	}
+
 	/* Motion Tracking. */
 	MovieClip *clip = BKE_object_movieclip_get(scene, ob, false);
 	if ((v3d->flag2 & V3D_SHOW_RECONSTRUCTION) && (clip != NULL)) {
 		BLI_assert(BLI_listbase_is_empty(&sgl->camera_path));
-		const bool is_select = DRW_state_is_select();
 		const bool is_solid_bundle = (v3d->bundle_drawtype == OB_EMPTY_SPHERE) &&
 		                             ((v3d->shading.type != OB_SOLID) ||
 		                              ((v3d->shading.flag & XRAY_FLAG(v3d)) == 0));
